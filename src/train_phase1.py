@@ -23,7 +23,7 @@ Changes from the ISMRM abstract experiment:
 Motion model: piecewise-constant rigid in-plane motion along the phase-encode (row) axis.
 With 1 mm voxels, translations are in mm.
 """
-import argparse, csv, json, math, os, time
+import argparse, csv, gc, json, math, os, time
 from pathlib import Path
 
 import numpy as np
@@ -116,7 +116,7 @@ def corrupt_all(X, sev, seed, dev, bs=64):
     outs = []
     for i in range(0, len(X), bs):
         x = torch.from_numpy(X[i:i + bs]).float().unsqueeze(1).to(dev)
-        outs.append(simulate_motion(x, sev, g).cpu())
+        outs.append(simulate_motion(x, sev, g).half().cpu())  # float16 on CPU to save RAM
     return torch.cat(outs)
 
 
@@ -130,10 +130,10 @@ def predict(net, X, dev, bs=32):
     net.eval()
     outs = []
     for i in range(0, len(X), bs):
-        x = X[i:i + bs].to(dev)
+        x = X[i:i + bs].to(dev).float()
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             y = x + net(x)
-        outs.append(y.float().clamp(0, 1).cpu())
+        outs.append(y.float().clamp(0, 1).half().cpu())
     return torch.cat(outs)
 
 
@@ -161,7 +161,7 @@ def train(mode, Xtr, val_in, val_ref, args, dev):
             opt.step()
             sched.step()
             run += loss.item()
-        val = F.l1_loss(predict(net, val_in, dev), val_ref).item()
+        val = F.l1_loss(predict(net, val_in, dev).float(), val_ref).item()
         mins = (time.time() - t0) / 60
         log.append({"epoch": ep + 1, "train_l1": run / spe, "val_l1_moderate": val, "minutes": mins})
         print(f"[{mode} s{args.seed}] epoch {ep + 1}/{args.epochs}  train {run / spe:.4f}  val {val:.4f}  {mins:.1f} min", flush=True)
@@ -182,7 +182,7 @@ def evaluate(pred, ref, masks, sids):
     p, r = pred.numpy()[:, 0], ref.numpy()[:, 0]
     rows = []
     for i in range(len(p)):
-        ps, ss, nm = masked_metrics(p[i], r[i], masks[i])
+        ps, ss, nm = masked_metrics(p[i].astype(np.float32), r[i].astype(np.float32), masks[i])
         rows.append({"sid": sids[i], "psnr": ps, "ssim": ss, "nmse": nm})
     return rows
 
@@ -237,19 +237,33 @@ def main():
 
     val_ref = torch.from_numpy(Xva).float().unsqueeze(1)
     val_in = corrupt_all(Xva, "moderate", 999, dev)
-    ref_te = torch.from_numpy(Xte).float().unsqueeze(1)
+    ref_te = torch.from_numpy(Xte).unsqueeze(1)  # float16
     test_in = {sev: corrupt_all(Xte, sev, 1234, dev) for sev in TEST_SEVS}  # identical across seeds and models
+
+    api = None
+    if args.repo:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(args.repo, repo_type="model", private=True, exist_ok=True)
 
     models, logs = {}, {}
     for mode in ["mild", "mixed"]:
         models[mode], logs[mode] = train(mode, Xtr, val_in, val_ref, args, dev)
         torch.save(models[mode].state_dict(), out / f"unet_{mode}.pt")
+        json.dump(logs[mode], open(out / f"train_log_{mode}.json", "w"), indent=1)
+        if api:  # checkpoint immediately so a later crash never loses training
+            api.upload_file(path_or_fileobj=str(out / f"unet_{mode}.pt"), repo_id=args.repo, repo_type="model",
+                            path_in_repo=f"seed{args.seed}/unet_{mode}.pt")
+    del Xtr
+    gc.collect()
 
+    ex = len(Xte) // 2  # example slice for the figure
     summary, per_slice_rows, per_subj_rows, preds = {}, [], [], {}
     for sev in TEST_SEVS:
         methods = {"input": test_in[sev]}
         for mode, net in models.items():
-            preds[(mode, sev)] = methods[mode] = predict(net, test_in[sev], dev)
+            methods[mode] = predict(net, test_in[sev], dev)
+            preds[(mode, sev)] = methods[mode][ex:ex + 1].float().clone()
         summary[sev] = {}
         subj = {}
         for name, pred in methods.items():
@@ -261,6 +275,8 @@ def main():
             }
             per_slice_rows += [{"severity": sev, "method": name, **r} for r in rows]
             per_subj_rows += [{"severity": sev, "method": name, "sid": s, **v} for s, v in subj[name].items()]
+        del methods
+        gc.collect()
         if sev != "none":
             ids = sorted(subj["mild"])
             for k in ("psnr", "ssim"):
@@ -296,13 +312,14 @@ def main():
     fig.savefig(out / "fig_metrics_vs_severity.png", dpi=300)
 
     # figure: example slice
-    i = len(Xte) // 2
+    i = ex
     sevs = ["mild", "moderate", "severe", "extreme"]
     cols = ["Reference", "Corrupted", "Mild-trained", "Mixed-trained", "|Error| mixed ×5"]
     fig, axs = plt.subplots(len(sevs), 5, figsize=(12, 2.6 * len(sevs)))
     for r, sev in enumerate(sevs):
-        ims = [ref_te[i, 0], test_in[sev][i, 0], preds[("mild", sev)][i, 0], preds[("mixed", sev)][i, 0],
-               (preds[("mixed", sev)][i, 0] - ref_te[i, 0]).abs() * 5 * torch.from_numpy(Mte[i]).float()]
+        ref_i = ref_te[i, 0].float()
+        ims = [ref_i, test_in[sev][i, 0].float(), preds[("mild", sev)][0, 0], preds[("mixed", sev)][0, 0],
+               (preds[("mixed", sev)][0, 0] - ref_i).abs() * 5 * torch.from_numpy(Mte[i]).float()]
         for c, im in enumerate(ims):
             axs[r, c].imshow(np.rot90(im.numpy()), cmap="gray", vmin=0, vmax=1)
             axs[r, c].axis("off")
@@ -315,10 +332,7 @@ def main():
     print(json.dumps({s: {m: summary[s][m]["subject_level"]["psnr"]["mean"] for m in ("input", "mild", "mixed")}
                       for s in TEST_SEVS}, indent=1), flush=True)
 
-    if args.repo:
-        from huggingface_hub import HfApi
-        api = HfApi()
-        api.create_repo(args.repo, repo_type="model", private=True, exist_ok=True)
+    if api:
         api.upload_folder(folder_path=str(out), repo_id=args.repo, repo_type="model", path_in_repo=f"seed{args.seed}")
         print(f"uploaded to {args.repo}/seed{args.seed}", flush=True)
 
