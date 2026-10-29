@@ -214,6 +214,9 @@ def main():
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--modes", default="mild,mixed", help="models to train, comma-separated")
+    ap.add_argument("--reuse_repo", default="",
+                    help="Hub repo to load models that are not trained here, from seed<N>/unet_<mode>.pt")
     ap.add_argument("--out", default="results")
     ap.add_argument("--repo", default="", help="Hub repo for results, e.g. NathanPereira/mocorr-phase1")
     args = ap.parse_args()
@@ -247,7 +250,18 @@ def main():
         api.create_repo(args.repo, repo_type="model", private=True, exist_ok=True)
 
     models, logs = {}, {}
+    to_train = [m.strip() for m in args.modes.split(",") if m.strip()]
     for mode in ["mild", "mixed"]:
+        if mode not in to_train:
+            if not args.reuse_repo:
+                raise SystemExit(f"'{mode}' is not trained here; pass --reuse_repo to load it")
+            from huggingface_hub import hf_hub_download
+            w = hf_hub_download(args.reuse_repo, f"seed{args.seed}/unet_{mode}.pt")
+            net = make_net().to(dev)
+            net.load_state_dict(torch.load(w, map_location=dev))
+            models[mode], logs[mode] = net, f"reused from {args.reuse_repo}/seed{args.seed}"
+            print(f"[{mode} s{args.seed}] loaded from {args.reuse_repo}", flush=True)
+            continue
         models[mode], logs[mode] = train(mode, Xtr, val_in, val_ref, args, dev)
         torch.save(models[mode].state_dict(), out / f"unet_{mode}.pt")
         json.dump(logs[mode], open(out / f"train_log_{mode}.json", "w"), indent=1)
